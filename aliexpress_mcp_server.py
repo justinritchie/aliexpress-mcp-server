@@ -2,8 +2,8 @@
 """
 AliExpress MCP Server
 
-Search AliExpress, pull clean product details, check shipping to Canada,
-and peek at the current cart — all read-only.
+Search AliExpress, pull clean product details, check shipping to the
+configured country (default: Canada, prices in CAD), and peek at the cart — all read-only.
 
 Auth: Session cookies from MCP Auth Bridge extension at
 ~/.mcp-credentials/aliexpress.json
@@ -31,6 +31,10 @@ CREDENTIALS_PATH = Path(
 
 COUNTRY = os.environ.get("ALIEXPRESS_COUNTRY", "CA")
 CURRENCY = os.environ.get("ALIEXPRESS_CURRENCY", "CAD")
+LOCALE = os.environ.get("ALIEXPRESS_LOCALE", "en_US")
+
+# Optional: inject an httpx transport (used by offline tests).
+_TRANSPORT: Optional[httpx.BaseTransport] = None
 
 BASE_URL = "https://www.aliexpress.com"
 USER_AGENT = (
@@ -44,22 +48,38 @@ logger = logging.getLogger("aliexpress-mcp")
 
 # ─── Auth ───────────────────────────────────────────────────────────────────
 
+def _region_cookie() -> str:
+    """aep_usuc_f controls ship-to region, display currency and locale."""
+    return f"site=glo&c_tp={CURRENCY}&region={COUNTRY}&b_locale={LOCALE}"
+
+
 def load_cookies() -> dict[str, str]:
-    """Load session cookies from the credential file written by MCP Auth Bridge."""
-    if not CREDENTIALS_PATH.exists():
-        return {}
-    try:
-        data = json.loads(CREDENTIALS_PATH.read_text())
-        return data.get("cookies", {})
-    except (json.JSONDecodeError, KeyError):
-        return {}
+    """
+    Load session cookies (optional) from the MCP Auth Bridge credential file,
+    then force the region cookie so prices/shipping are for COUNTRY/CURRENCY
+    regardless of the account's or the IP's default.
+    """
+    cookies: dict[str, str] = {}
+    if CREDENTIALS_PATH.exists():
+        try:
+            data = json.loads(CREDENTIALS_PATH.read_text())
+            cookies = dict(data.get("cookies", {}) or {})
+        except (json.JSONDecodeError, KeyError, AttributeError):
+            cookies = {}
+    cookies["aep_usuc_f"] = _region_cookie()
+    return cookies
+
+
+def has_login_session(cookies: dict[str, str]) -> bool:
+    """True if cookies look like a logged-in session (not just our region cookie)."""
+    return any(k in cookies for k in ("xman_us_t", "xman_t", "_m_h5_tk", "x_router_us_f", "aep_common_f"))
 
 
 def get_client(require_auth: bool = False, referer: str = BASE_URL) -> httpx.Client:
     """Create an HTTP client with session cookies and realistic browser headers."""
     cookies = load_cookies()
 
-    if require_auth and not cookies:
+    if require_auth and not has_login_session(cookies):
         raise ValueError(
             "No AliExpress session found. Open aliexpress.com in Chrome, "
             "log in, and click 'Save AliExpress' in the MCP Auth Bridge extension."
@@ -70,7 +90,7 @@ def get_client(require_auth: bool = False, referer: str = BASE_URL) -> httpx.Cli
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-CA,en;q=0.9",
+        "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
         "Referer": referer,
         "Upgrade-Insecure-Requests": "1",
@@ -83,6 +103,7 @@ def get_client(require_auth: bool = False, referer: str = BASE_URL) -> httpx.Cli
         headers["Cookie"] = cookie_str
 
     return httpx.Client(
+        transport=_TRANSPORT,
         base_url=BASE_URL,
         headers=headers,
         follow_redirects=True,
@@ -119,6 +140,10 @@ AUTH_EXPIRED_MSG = (
 # `_m_h5_tk` cookies — the real browser retries; we can too.
 
 MTOP_APP_KEY = "12574478"
+
+# Anonymous/refreshed MTOP token cookies, kept in memory for the server's
+# lifetime so the bootstrap round-trip happens once, not on every call.
+_TOKEN_CACHE: dict[str, str] = {}
 MTOP_BASE = "https://acs.aliexpress.com"
 
 
@@ -151,14 +176,14 @@ def mtop_call(
     Raises RuntimeError on signing/network failure.
     """
     if cookies is None:
-        cookies = load_cookies()
+        cookies = {**load_cookies(), **_TOKEN_CACHE}
 
-    token = _h5_token_prefix(cookies)
-    if not token:
-        raise RuntimeError(
-            "No _m_h5_tk cookie found. Re-save AliExpress credentials via the "
-            "MCP Auth Bridge extension."
-        )
+    # No token yet (anonymous use): sign with an empty token. MTOP replies
+    # FAIL_SYS_TOKEN_EMPTY and sets a fresh _m_h5_tk cookie; the retry below
+    # then signs properly — the same dance mtop.js does in a fresh browser.
+    token = _h5_token_prefix(cookies) or ""
+    if not token and retries < 1:
+        raise RuntimeError("MTOP token bootstrap failed (no _m_h5_tk issued).")
 
     data_str = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
     t_ms = str(int(time.time() * 1000))
@@ -183,14 +208,14 @@ def mtop_call(
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-CA,en;q=0.9",
+        "Accept-Language": "en-US,en;q=0.9",
         "Referer": referer or f"{BASE_URL}/",
         "Origin": BASE_URL,
         "Cookie": cookie_str,
     }
     url = f"{MTOP_BASE}/h5/{api}/{version}/"
 
-    with httpx.Client(timeout=30.0, follow_redirects=True) as c:
+    with httpx.Client(timeout=30.0, follow_redirects=True, transport=_TRANSPORT) as c:
         resp = c.get(url, params=params, headers=headers)
 
         # MTOP sometimes wraps valid JSON inside `mtopjsonp1({...})` even when
@@ -218,6 +243,11 @@ def mtop_call(
                 val = resp.cookies.get(name)
                 if val is not None:
                     new_cookies[name] = val
+            if _h5_token_prefix(new_cookies) is None:
+                return data  # server didn't issue a token; surface the failure
+            for k in ("_m_h5_tk", "_m_h5_tk_enc"):
+                if k in new_cookies:
+                    _TOKEN_CACHE[k] = new_cookies[k]
             return mtop_call(api, version, payload, cookies=new_cookies, retries=retries - 1, referer=referer)
 
         return data
@@ -243,7 +273,16 @@ def _walk_find(obj: Any, match_keys: set) -> Any:
 
 # ─── Parsing Helpers ────────────────────────────────────────────────────────
 
-PRICE_RE = re.compile(r"(?:C\$|CA\$|US\$|\$|CAD|USD)\s*([\d,]+\.\d{2}|[\d,]+)")
+CURRENCY_TOKENS = r"(?:₪|ILS|NIS|C\$|CA\$|US\$|A\$|\$|€|EUR|£|GBP|CAD|USD)"
+# Symbol before ("₪12.34", "US $5") or after ("12.34₪", "1,234.50 ILS").
+# Assumes en_US number format (comma = thousands separator).
+PRICE_RE = re.compile(CURRENCY_TOKENS + r"\s*([\d,]+(?:\.\d{1,2})?)")
+PRICE_AFTER_RE = re.compile(r"([\d,]+(?:\.\d{1,2})?)\s*" + CURRENCY_TOKENS)
+ANY_PRICE_RE = re.compile(r"(?:" + CURRENCY_TOKENS + r"\s*)?[\d,]+\.\d{2}(?:\s*" + CURRENCY_TOKENS + r")?")
+
+
+def fmt_money(v: Optional[float], currency: Optional[str] = None) -> str:
+    return f"{v:,.2f} {currency or CURRENCY}" if v is not None else "?"
 ITEM_ID_RE = re.compile(r"/item/(\d+)\.html")
 
 
@@ -251,7 +290,7 @@ def parse_price(text: str) -> Optional[float]:
     """Pull the first price-looking number out of a string."""
     if not text:
         return None
-    m = PRICE_RE.search(text)
+    m = PRICE_RE.search(text) or PRICE_AFTER_RE.search(text)
     if m:
         try:
             return float(m.group(1).replace(",", ""))
@@ -297,8 +336,69 @@ def _extract_embedded_json(html: str, var_names: list[str]) -> Optional[dict]:
     return None
 
 
+_ITEMLIST_KEY = '"itemList":{"content":'
+
+
+def _search_items_from_itemlist(html: str) -> list[dict]:
+    """
+    Current (verified live, Oct 2026) search layout: product cards are embedded
+    as `"itemList":{"content":[...]}` inside the _dida_config_ init blob, not in
+    window.runParams. Locate the array and JSON-decode it in place.
+    """
+    i = html.find(_ITEMLIST_KEY)
+    if i < 0:
+        return []
+    try:
+        arr, _ = json.JSONDecoder().raw_decode(html, i + len(_ITEMLIST_KEY))
+    except json.JSONDecodeError:
+        return []
+    out: list[dict] = []
+    for it in arr if isinstance(arr, list) else []:
+        if not isinstance(it, dict):
+            continue
+        pid = it.get("productId") or it.get("redirectedId")
+        t = it.get("title")
+        title = t.get("displayTitle") if isinstance(t, dict) else t
+        if not pid or not title:
+            continue
+        prices = it.get("prices") or {}
+        sp = prices.get("salePrice") or {}
+        op = prices.get("originalPrice") or {}
+        price = sp.get("minPrice") if isinstance(sp, dict) else None
+        orig = op.get("minPrice") if isinstance(op, dict) else None
+        disc = sp.get("discount") if isinstance(sp, dict) else None
+        if disc is None and price and orig and orig > price:
+            disc = round((1 - price / orig) * 100)
+        ev = it.get("evaluation") or {}
+        rating = ev.get("starRating") if isinstance(ev, dict) else None
+        tags = []
+        for sp_ in it.get("sellingPoints") or []:
+            tc = (sp_ or {}).get("tagContent") or {}
+            txt = tc.get("tagText") or tc.get("displayTagText")
+            if txt:
+                tags.append(str(txt))
+        out.append({
+            "item_id": str(pid),
+            "title": str(title).strip(),
+            "price": float(price) if isinstance(price, (int, float)) else None,
+            "original_price": float(orig) if isinstance(orig, (int, float)) else None,
+            "currency": (sp.get("currencyCode") if isinstance(sp, dict) else None) or CURRENCY,
+            "discount_pct": int(disc) if isinstance(disc, (int, float)) and disc else None,
+            "rating": float(rating) if isinstance(rating, (int, float)) else None,
+            "sold_count": (it.get("trade") or {}).get("tradeDesc"),
+            "tags": tags,
+            "url": f"{BASE_URL}/item/{pid}.html",
+        })
+    return out
+
+
 def parse_search_results(html: str) -> list[dict]:
     """Parse product cards from an AliExpress search results page."""
+    current = _search_items_from_itemlist(html)
+    if current:
+        return current
+
+    # Legacy layouts below (window.runParams / HTML cards), kept as fallbacks.
     products: list[dict] = []
     seen_ids: set[str] = set()
 
@@ -417,7 +517,7 @@ def parse_search_results(html: str) -> list[dict]:
 
         # Try to find a second (higher) price for original
         original_price = None
-        all_prices = [parse_price(t) for t in re.findall(r"[A-Z]{0,2}\$?\s*[\d,]+\.\d{2}", card_text)]
+        all_prices = [parse_price(t) for t in ANY_PRICE_RE.findall(card_text)]
         all_prices = [p for p in all_prices if p is not None]
         if len(all_prices) >= 2:
             sale_price = min(all_prices)
@@ -597,7 +697,7 @@ def parse_cart(html: str) -> dict:
 
         card = link.find_parent(["div", "li", "article"]) or link
         card_text = card.get_text(" ", strip=True)
-        all_prices = [parse_price(t) for t in re.findall(r"[A-Z]{0,2}\$\s*[\d,]+\.\d{2}", card_text)]
+        all_prices = [parse_price(t) for t in ANY_PRICE_RE.findall(card_text)]
         all_prices = [p for p in all_prices if p is not None]
         sale_price = min(all_prices) if all_prices else None
 
@@ -620,7 +720,7 @@ def parse_cart(html: str) -> dict:
         (r"Shipping", "shipping_total"),
         (r"(?:Grand\s*)?Total", "grand_total"),
     ]:
-        m = re.search(label + r"[^\n$]*?([A-Z]{0,2}\$\s*[\d,]+\.\d{2})", text, re.IGNORECASE)
+        m = re.search(label + r"[^\n]*?(" + ANY_PRICE_RE.pattern + r")", text, re.IGNORECASE)
         if m:
             result[key] = parse_price(m.group(1))
 
@@ -646,8 +746,10 @@ def search_products(
     Args:
         query: Search term (e.g., "groudon plush", "usb c cable")
         min_rating: Minimum rating (0-5, e.g., 4.5). 0 disables filter.
-        max_price: Maximum price in CAD. 0 disables filter.
+            Unrated listings are excluded when this is set.
+        max_price: Maximum price in the configured currency (default CAD). 0 disables filter.
         sort_by: One of "best_match", "orders", "price_asc", "price_desc"
+            (all four verified live).
     """
     # AliExpress URL slug pattern
     slug = quote_plus(query.strip()).replace("+", "-")
@@ -683,7 +785,7 @@ def search_products(
             if min_rating > 0:
                 filters.append(f"rating ≥ {min_rating}")
             if max_price > 0:
-                filters.append(f"price ≤ ${max_price:.2f}")
+                filters.append(f"price ≤ {fmt_money(max_price)}")
             suffix = f" with {', '.join(filters)}" if filters else ""
             return f"No products found for '{query}'{suffix}."
 
@@ -691,15 +793,18 @@ def search_products(
         for p in products[:25]:
             line = f"- {p['title']}"
             if p["price"] is not None:
-                line += f" — ${p['price']:.2f} {CURRENCY}"
+                line += f" — {fmt_money(p['price'], p.get('currency'))}"
             if p["original_price"] is not None and p["original_price"] > (p["price"] or 0):
-                line += f" (was ${p['original_price']:.2f})"
+                line += f" (was {fmt_money(p['original_price'])})"
             if p["discount_pct"]:
                 line += f" [-{p['discount_pct']}%]"
             if p["rating"]:
                 line += f" ★{p['rating']}"
             if p["sold_count"]:
                 line += f" · {p['sold_count']}"
+            useful = [t for t in p.get("tags", []) if not t.lower().startswith("save ")]
+            if useful:
+                line += f" · {'; '.join(useful[:2])}"
             line += f"\n  item_id: {p['item_id']}"
             lines.append(line)
         return "\n".join(lines)
@@ -716,7 +821,7 @@ def _fetch_pdp_mtop(item_id: str) -> Optional[dict]:
     payload = {
         "productId": item_id,
         "_currency": CURRENCY,
-        "_lang": "en_US",
+        "_lang": LOCALE,
         "country": COUNTRY,
         "channel": "",
         "sourceType": "pc",
@@ -943,10 +1048,7 @@ def get_product_details(item_id: str = "", url: str = "") -> str:
     if not item_id:
         return "Provide either item_id or a full AliExpress product url."
 
-    cookies = load_cookies()
-    if not cookies:
-        return AUTH_EXPIRED_MSG
-
+    # Login not required: mtop_call bootstraps an anonymous token if needed.
     # Primary path: MTOP signed API
     d: Optional[dict] = None
     try:
@@ -988,11 +1090,11 @@ def get_product_details(item_id: str = "", url: str = "") -> str:
     if d.get("price") is not None:
         if d.get("price_range"):
             lo, hi = d["price_range"]
-            line = f"Price: ${lo:.2f}–${hi:.2f} {CURRENCY}"
+            line = f"Price: {lo:,.2f}–{hi:,.2f} {CURRENCY}"
         else:
-            line = f"Price: ${d['price']:.2f} {CURRENCY}"
+            line = f"Price: {fmt_money(d['price'])}"
         if d.get("original_price") and d["original_price"] > d["price"]:
-            line += f" (was ${d['original_price']:.2f}"
+            line += f" (was {fmt_money(d['original_price'])}"
             if d.get("discount_pct"):
                 line += f", -{d['discount_pct']}%"
             line += ")"
@@ -1014,7 +1116,7 @@ def get_product_details(item_id: str = "", url: str = "") -> str:
         if d.get("store_url"):
             lines.append(f"Store: {d['store_url']}")
     if d.get("shipping_cost") is not None:
-        ship_line = "Shipping: " + ("Free" if d["shipping_cost"] == 0 else f"${d['shipping_cost']:.2f} {CURRENCY}")
+        ship_line = "Shipping: " + ("Free" if d["shipping_cost"] == 0 else fmt_money(d["shipping_cost"]))
         lines.append(ship_line)
     if d.get("shipping_estimate"):
         eta_line = f"Estimated delivery: {d['shipping_estimate']}"
@@ -1030,15 +1132,11 @@ def get_product_details(item_id: str = "", url: str = "") -> str:
 def get_shipping_estimate(item_id: str) -> str:
     """
     Check shipping time and cost for a product to the configured country
-    (default: Canada/Vancouver, BC).
+    (default: Canada; set ALIEXPRESS_COUNTRY to change).
 
     Args:
         item_id: AliExpress item ID (e.g., "1005007655628250")
     """
-    cookies = load_cookies()
-    if not cookies:
-        return AUTH_EXPIRED_MSG
-
     try:
         resp = _fetch_pdp_mtop(item_id)
     except Exception as e:
@@ -1059,7 +1157,7 @@ def get_shipping_estimate(item_id: str) -> str:
 
     lines = [f"Shipping to {COUNTRY} for item {item_id}:"]
     if d.get("shipping_cost") is not None:
-        lines.append("  Cost: " + ("Free" if d["shipping_cost"] == 0 else f"${d['shipping_cost']:.2f} {CURRENCY}"))
+        lines.append("  Cost: " + ("Free" if d["shipping_cost"] == 0 else fmt_money(d["shipping_cost"])))
     if d.get("shipping_estimate"):
         lines.append(f"  Estimated delivery: {d['shipping_estimate']}")
     if d.get("ship_from"):
@@ -1260,8 +1358,8 @@ def view_cart() -> str:
     re-save AliExpress cookies via the MCP Auth Bridge extension.
     """
     cookies = load_cookies()
-    if not cookies:
-        return AUTH_EXPIRED_MSG
+    if not has_login_session(cookies):
+        return AUTH_EXPIRED_MSG + " (view_cart is the only tool that needs a login.)"
 
     try:
         resp = mtop_call(
@@ -1324,9 +1422,9 @@ def view_cart() -> str:
     for it in items:
         line = f"- {it['title']}"
         if it.get("price") is not None:
-            line += f" — ${it['price']:.2f} {it.get('currency') or currency}"
+            line += f" — {fmt_money(it['price'], it.get('currency') or currency)}"
         if it.get("original_price") and it["original_price"] > (it.get("price") or 0):
-            line += f" (was ${it['original_price']:.2f})"
+            line += f" (was {fmt_money(it['original_price'], currency)})"
         qty = it.get("quantity") or 1
         try:
             if int(qty) != 1:
@@ -1336,7 +1434,7 @@ def view_cart() -> str:
         if it.get("sku_info"):
             line += f"\n  variant: {it['sku_info']}"
         if it.get("shipping_cost") is not None:
-            ship_str = "Free" if it["shipping_cost"] == 0 else f"${it['shipping_cost']:.2f}"
+            ship_str = "Free" if it["shipping_cost"] == 0 else fmt_money(it["shipping_cost"], currency)
             line += f"\n  shipping: {ship_str}"
         if it.get("delivery_date"):
             line += f"\n  delivery: {it['delivery_date']}"
@@ -1349,11 +1447,11 @@ def view_cart() -> str:
     if cart.get("subtotal") is not None or cart.get("shipping_fee") is not None or cart.get("total") is not None:
         lines.append("")
         if cart.get("subtotal") is not None:
-            lines.append(f"Subtotal: ${cart['subtotal']:.2f} {currency}")
+            lines.append(f"Subtotal: {fmt_money(cart['subtotal'], currency)}")
         if cart.get("shipping_fee") is not None:
-            lines.append(f"Shipping: ${cart['shipping_fee']:.2f} {currency}")
+            lines.append(f"Shipping: {fmt_money(cart['shipping_fee'], currency)}")
         if cart.get("total") is not None:
-            lines.append(f"Estimated total: ${cart['total']:.2f} {currency}")
+            lines.append(f"Estimated total: {fmt_money(cart['total'], currency)}")
 
     return "\n".join(lines)
 

@@ -1,6 +1,8 @@
 # AliExpress MCP Server
 
-An MCP server that wraps AliExpress search and product detail scraping for a Canadian shopper — prices in CAD, shipping to Vancouver, BC.
+An MCP server that wraps AliExpress search and product detail scraping. Defaults to shipping to Canada with prices in CAD; set `ALIEXPRESS_COUNTRY` / `ALIEXPRESS_CURRENCY` (and optionally `ALIEXPRESS_LOCALE`) for another region.
+
+Search, product details and shipping work without logging in; only `view_cart` needs session cookies. Run the offline tests with `pytest tests`, or `python smoke_test.py` for a live check.
 
 Read-only by design: it searches, fetches product details, and checks shipping. It does **not** add to cart, check out, or pay.
 
@@ -23,7 +25,7 @@ sign = md5(token + "&" + t_ms + "&" + "12574478" + "&" + json_payload)
 
 where `token` is the prefix of `_m_h5_tk` before the underscore, and `12574478` is AliExpress's public web `appKey`. Token refresh on `FAIL_SYS_TOKEN_EXPIRED` is handled automatically.
 
-Search still uses the simpler HTML path (embedded `window.runParams` JSON from the search SSR HTML) — no signed calls needed.
+Search still uses the simpler HTML path — no signed calls needed. `window.runParams` no longer exists on search pages, so cards are read from the embedded `"itemList":{"content":[...]}` array in the SSR HTML.
 
 ## Setup
 
@@ -33,7 +35,7 @@ Search still uses the simpler HTML path (embedded `window.runParams` JSON from t
    pip install -r requirements.txt
    ```
 
-2. Install the [MCP Auth Bridge](https://github.com/justinritchie/mcp-auth-bridge) Chrome extension. The `aliexpress` entry is already in its `sites.json`.
+2. *(Optional, only for `view_cart`)* Install the [MCP Auth Bridge](https://github.com/justinritchie/mcp-auth-bridge) Chrome extension. The `aliexpress` entry is already in its `sites.json`.
 
 3. Open `https://www.aliexpress.com`, log in, then click **Save AliExpress** in the extension popup. This writes cookies to `~/.mcp-credentials/aliexpress.json`.
 
