@@ -772,6 +772,8 @@ def _extract_pdp_fields(mtop_resp: dict, item_id: str) -> dict:
         "ship_days_min": None,
         "ship_days_max": None,
         "image_url": None,
+        "variants": [],
+        "promo_warning": None,
     }
 
     result = mtop_resp.get("data", {}).get("result", {})
@@ -813,23 +815,82 @@ def _extract_pdp_fields(mtop_resp: dict, item_id: str) -> dict:
                 elif op.get("formatedAmount"):
                     d["original_price"] = parse_price(op["formatedAmount"])
 
-        # If this is a variant listing, compute a price range from skuPriceInfoMap
-        sku_map = pn.get("skuPriceInfoMap")
-        if isinstance(sku_map, dict) and sku_map:
-            prices = []
-            for sku in sku_map.values():
-                if isinstance(sku, dict):
-                    sp = sku.get("salePriceString")
-                    if isinstance(sp, str):
-                        p = parse_price(sp)
-                        if p is not None:
-                            prices.append(p)
-            if prices:
-                lo, hi = min(prices), max(prices)
-                if lo != hi:
-                    d["price_range"] = (lo, hi)
-                if d["price"] is None:
-                    d["price"] = lo
+    # ── Variants (SKU) ────────────────────────────────────────────────
+    # SKU.skuPaths lists every variant (skuAttr "propId:valId#Display Name",
+    # salable, skuStock). Per-SKU prices are in PRICE.skuIdStrPriceInfoMap,
+    # per-SKU buy limits in QUANTITY_PC.allSkuQuantityView (welcome deals show
+    # "Max. 1 pcs/shopper"), promo type in PRICE_BANNER.atmosphereCodeMap.
+    sku_prices = {}
+    if isinstance(pn, dict):
+        sku_prices = pn.get("skuIdStrPriceInfoMap") or pn.get("skuPriceInfoMap") or {}
+    qty_view = (result.get("QUANTITY_PC") or {}).get("allSkuQuantityView") or {}
+    promo_map = (result.get("PRICE_BANNER") or {}).get("atmosphereCodeMap") or {}
+    sku_block = result.get("SKU") or {}
+    # "propId:valId" → display name, for skuAttr parts without a "#Name" suffix.
+    value_names: dict[str, str] = {}
+    for prop in sku_block.get("skuProperties") or []:
+        if not isinstance(prop, dict):
+            continue
+        for val in prop.get("skuPropertyValues") or []:
+            if isinstance(val, dict):
+                key = f"{prop.get('skuPropertyId')}:{val.get('propertyValueIdLong')}"
+                value_names[key] = (
+                    val.get("propertyValueDisplayName")
+                    or val.get("propertyValueDefinitionName")
+                    or val.get("propertyValueName")
+                    or key
+                )
+    for path in sku_block.get("skuPaths") or []:
+        if not isinstance(path, dict):
+            continue
+        sid = str(path.get("skuIdStr") or path.get("skuId") or "")
+        attr = path.get("skuAttr") or ""
+        parts = []
+        for part in attr.split(";"):
+            key, _, label = part.partition("#")
+            parts.append(label or value_names.get(key, key))
+        name = "; ".join(p for p in parts if p) or sid
+        v: dict[str, Any] = {
+            "sku_id": sid,
+            "name": name,
+            "salable": bool(path.get("salable", True)),
+            "stock": path.get("skuStock"),
+            "price": None,
+            "original_price": None,
+            "max_buy": None,
+            "limit_hint": None,
+            "promo": promo_map.get(sid),
+        }
+        sp = sku_prices.get(sid) if isinstance(sku_prices, dict) else None
+        if isinstance(sp, dict):
+            v["price"] = parse_price(sp.get("salePriceString") or "")
+            op = sp.get("originalPrice")
+            if isinstance(op, dict) and isinstance(op.get("value"), (int, float)):
+                v["original_price"] = float(op["value"])
+        qv = qty_view.get(sid)
+        if isinstance(qv, dict):
+            v["max_buy"] = qv.get("maxBuyCount")
+            v["limit_hint"] = qv.get("hintText") or qv.get("maxBuyCountStr")
+        d["variants"].append(v)
+
+    # Price range only over variants you can actually buy.
+    buyable = [v["price"] for v in d["variants"] if v["salable"] and v["price"] is not None]
+    if buyable:
+        lo, hi = min(buyable), max(buyable)
+        d["price_range"] = (lo, hi) if lo != hi else None
+        if d["price"] is None:
+            d["price"] = lo
+
+    # Welcome/new-user deals are capped (usually 1 pc) and not the regular price.
+    for v in d["variants"]:
+        promo = (v["promo"] or "").lower()
+        if "welcome" in promo or "new_user" in promo or v["max_buy"] == 1:
+            d["promo_warning"] = (
+                "Shown prices include a new-user/welcome deal limited to "
+                f"{v['limit_hint'] or 'a few pcs'}: the regular price is higher "
+                "(between sale and original price). Do not use it for bulk."
+            )
+            break
 
     if d["discount_pct"] is None and d["price"] and d["original_price"] and d["original_price"] > d["price"]:
         d["discount_pct"] = round((1 - d["price"] / d["original_price"]) * 100)
@@ -1023,6 +1084,26 @@ def get_product_details(item_id: str = "", url: str = "") -> str:
         lines.append(eta_line)
     if d.get("ship_from"):
         lines.append(f"Ships from: {d['ship_from']}")
+    if d.get("promo_warning"):
+        lines.append(f"⚠️ {d['promo_warning']}")
+    if d.get("variants"):
+        lines.append(f"Variants ({len(d['variants'])}):")
+        for v in d["variants"]:
+            vl = f"- {v['name']}"
+            if v["price"] is not None:
+                vl += f" — {v['price']:.2f} {CURRENCY}"
+            if v["original_price"] and v["original_price"] > (v["price"] or 0):
+                vl += f" (was {v['original_price']:.2f})"
+            if not v["salable"]:
+                vl += " [SOLD OUT]"
+            elif v["stock"] is not None:
+                vl += f" · stock {v['stock']}"
+            if v["limit_hint"] and v["salable"]:
+                vl += f" · {v['limit_hint']}"
+            if v["promo"]:
+                vl += f" · promo: {v['promo']}"
+            vl += f"\n  sku_id: {v['sku_id']}"
+            lines.append(vl)
     return "\n".join(lines)
 
 
